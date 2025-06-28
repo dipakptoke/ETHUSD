@@ -5,33 +5,13 @@ import aiohttp
 import json, requests, pandas as pd
 from datetime import datetime, timedelta, timezone
 import os, logging, math
+from dotenv import load_dotenv
+load_dotenv()
 import base64
 import hmac
 import hashlib
-
-# === File paths for logs ===
-HEARTBEAT_FILE = "/app/heartbeat"
-TRADES_LOG_PATH = "data/live_trades.csv"
-from dotenv import load_dotenv
-
-# === Global variables for 15m candle aggregation ===
-in_position = False
-position_state = {}
-ohlc_data = pd.DataFrame()
-pending_setup = None
-current_15m_candle = None
-last_15m_candle_start_time = None
-finalized_candle_timestamps = set()
-trade_id_counter = 0
-open_order_id = None
-
-# === Load secrets ===
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-LIVE_MODE = os.getenv("LIVE_MODE", "0") == "1"
-DELTA_API_KEY = os.getenv("DELTA_API_KEY")
-DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
+import time
+import csv
 
 # === Logging ===
 os.makedirs("logs", exist_ok=True)
@@ -42,6 +22,35 @@ logging.basicConfig(
         logging.FileHandler("logs/eth_bot.log"),
         logging.StreamHandler()
     ])
+
+
+# === File paths for logs ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+LIVE_MODE = os.getenv("LIVE_MODE", "0") == "1"
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
+DELTA_API_KEY = os.getenv("DELTA_API_KEY")
+DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
+ENTRY_BUFFER = float(os.getenv("ENTRY_BUFFER", "9.0"))
+logging.info(f"🎯 ENTRY_BUFFER loaded: ±{ENTRY_BUFFER} points")
+ENABLE_CANDLE_FALLBACK = True  # Set to False to disable fallback logic
+MAX_SLIPPAGE_POINTS = float(os.getenv("MAX_SLIPPAGE_POINTS", "27"))
+HEARTBEAT_FILE = "/app/heartbeat"
+TRADES_LOG_PATH = "data/live_trades.csv"
+
+# === Global variables for 15m candle aggregation ===
+PRODUCT_ID = int(os.getenv("PRODUCT_ID", "3136"))
+in_position = False
+position_state = {}
+ohlc_data = pd.DataFrame()
+pending_setup = None
+current_15m_candle = None
+last_15m_candle_start_time = None
+finalized_candle_timestamps = set()
+trade_id_counter = 0
+open_order_id = None
+# Cache for latest tick
+latest_tick = {"price": None, "timestamp": None}
 
 # === Config ===
 SYMBOL = "ETHUSD"
@@ -80,6 +89,13 @@ async def send_telegram(msg):
                     await response.text()
         except Exception as e:
             logging.error(f"Telegram error: {e}")
+
+def write_heartbeat():
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+    except Exception as e:
+        logging.error(f"Heartbeat write failed: {e}")
 
 # === Delta Exchange Order Placement (Add HMAC-SHA256 signature if required) ===
 def generate_signature(secret_key, method, endpoint, body=""):
@@ -141,6 +157,54 @@ async def place_market_order(side, qty, order_type="limit"):
     except Exception as e:
         logging.error(f"❌ Order placement failed: {e}")
         return {"status": "error", "message": str(e)}
+
+async def place_bracket_order(side, price, qty, sl_price, tp_price):
+    endpoint = "/v2/orders/bracket"
+    url = "https://api.india.delta.exchange" + endpoint
+
+    payload = {
+        "product_id": PRODUCT_ID,
+        "side": side.lower(),
+        "order_type": "limit_order",
+        "price": str(price),
+        "size": qty,
+        "stop_loss_order": {
+            "order_type": "market_order",
+            "stop_price": str(sl_price)
+        },
+        "take_profit_order": {
+            "order_type": "limit_order",
+            "stop_price": str(tp_price),
+            "limit_price": str(tp_price)
+        },
+        "bracket_stop_trigger_method": "last_traded_price"
+    }
+
+    body = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    ts, signature = generate_signature(DELTA_API_SECRET, "POST", endpoint, body)
+
+    headers = {
+        "api-key": DELTA_API_KEY,
+        "timestamp": ts,
+        "signature": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    if TEST_MODE:
+        logging.info("🧪 TEST MODE | Bracket order not sent. Would send:")
+        logging.info(json.dumps(payload, indent=2))
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=body) as resp:
+                resp_json = await resp.json()
+                logging.info(f"📤 Bracket Order Response: {resp_json}")
+                return resp_json
+    except Exception as e:
+        logging.error(f"❌ Bracket order failed: {e}")
+        return {"error": str(e)}
 
 # === Candle Management (Only finalize_candle is used now, as WS handles updates) ===
 def finalize_candle(candle):
@@ -260,6 +324,7 @@ async def detect_trade():
     )
     await send_telegram(msg)
     logging.info(f"🎯 Setup: {msg}")
+    logging.info(f"📏 Entry buffer zone: {entry - ENTRY_BUFFER:.2f} to {entry + ENTRY_BUFFER:.2f}")
 
     pending_setup = {
         "direction": direction,
@@ -270,72 +335,79 @@ async def detect_trade():
         "timestamp": setup_candle["timestamp"],
         "triggered": False
     }
+
+async def process_live_price(price, ts):
+    global in_position, pending_setup
+    logging.debug(f"🟡 Tick | Price: {price} | Time: {ts.strftime('%H:%M:%S')}")
+
+    await check_exit(price, ts)
+
+    if pending_setup and not pending_setup.get("triggered", False) and not in_position:
+        direction = pending_setup["direction"]
+        entry = pending_setup["entry"]
+
+        buffer_low = entry - ENTRY_BUFFER
+        buffer_high = entry + ENTRY_BUFFER
+
+        if direction == "SELL" and buffer_low <= price <= buffer_high:
+            logging.info(f"✅ SELL Triggered | Tick: {price} | Entry: {entry} | Buffer: {buffer_low:.1f}–{buffer_high:.1f}")
+            asyncio.create_task(execute_trade("SELL", price, ts))
+            pending_setup["triggered"] = True
+
+        elif direction == "BUY" and buffer_low <= price <= buffer_high:
+            logging.info(f"✅ BUY Triggered | Tick: {price} | Entry: {entry} | Buffer: {buffer_low:.1f}–{buffer_high:.1f}")
+            asyncio.create_task(execute_trade("BUY", price, ts))
+            pending_setup["triggered"] = True
+
 async def execute_trade(direction, price, ts, fallback=False):
-    global in_position, position_state, trade_id_counter, open_order_id, pending_setup
+    global in_position, trade_id_counter, pending_setup, last_price, position_state
 
-    if not pending_setup or pending_setup.get("triggered"):
-        return
-
-    # Ensure fallback only occurs within the very next candle
-    setup_ts = pending_setup["timestamp"]
-    current_ts = ts
-    if fallback and (current_ts - setup_ts) > timedelta(minutes=15):
-        logging.info("⚠️ Fallback skipped — too late for entry.")
-        return
-
+    entry = price
+    setup_ts = pending_setup.get("timestamp") if pending_setup else ts
     sl = pending_setup["sl"]
-    qty = pending_setup["qty"]
     risk = pending_setup["risk"]
-    entry = pending_setup["entry"]
-    timestamp = ts
+    qty = pending_setup["qty"]
 
-    pending_setup["triggered"] = True
-    in_position = True
-    trade_id_counter += 1
-    open_order_id = f"sim-{trade_id_counter}"
+    # Safety: Skip if time drifted too far
+    current_ts = datetime.now(timezone.utc)
+    if fallback and (current_ts - setup_ts) > timedelta(minutes=15):
+        logging.warning("⚠️ Fallback trigger too delayed. Skipping execution.")
+        return
 
-    position_state = {
-        "entry_time": timestamp,
-        "entry": entry,
-        "sl": sl,
-        "direction": direction,
-        "risk": risk,
-        "qty": qty,
-        "trailing_sl": sl,
-        "emergency": False,
-        "expected_loss": qty * risk,
-        "trade_id": trade_id_counter,
-        "order_id": open_order_id
-    }
+    direction_str = "BUY" if direction == "BUY" else "SELL"
+    logging.info(f"📈 EXECUTING {direction_str} | Price: {entry}, SL: {sl}, Qty: {qty}")
 
-    log_prefix = "🟢 Fallback Trigger" if fallback else "🚀 Breakout confirmed"
-    logging.info(f"{log_prefix}: {direction} @ {price}, executing setup from {pending_setup['timestamp']}")
-
-    msg = (
-        f"✅ Executing {direction} breakout at {price} on {timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-        f"📤 Sending STOP-MARKET Order: {direction} {qty} @ {sl}"
-    )
-    await send_telegram(msg)
-    logging.info(msg)
+    tp = entry + 2 * risk if direction == "BUY" else entry - 2 * risk
 
     if LIVE_MODE:
-        await place_market_order(direction, qty)
+        await place_bracket_order(direction, entry, qty, sl, tp)
     else:
-        simulated_fill_msg = {
-            "channel": "v2/fills",
-            "data": {
-                "order_id": open_order_id,
-                "price": entry,
-                "qty": qty
-            }
-        }
-        await asyncio.to_thread(on_message, None, json.dumps(simulated_fill_msg))
+        logging.info(f"🧪 SIM MODE ENTRY | {direction} at {entry}, SL: {sl}, TP: {tp}, Qty: {qty}")
 
-def check_exit(price, ts): # `price` likely comes from a separate WebSocket price stream (e.g., trades)
+    # Update internal state
+    trade_id_counter += 1
+    in_position = True
+    last_price = entry
+
+    trade_log = {
+        "id": trade_id_counter,
+        "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+        "direction": direction,
+        "entry_price": entry,
+        "sl": sl,
+        "qty": qty,
+        "status": "OPEN"
+    }
+    save_trade_log(trade_log)
+
+    msg = f"📥 {direction} ORDER PLACED\n🎯 Entry: {entry}\n🛑 SL: {sl}\n📦 Qty: {qty}"
+    await send_telegram(msg)
+
+async def check_exit(price, ts):
     global in_position, position_state, open_order_id
     if not in_position:
         return
-    # Block-based trailing stop-loss logic
+
     direction = position_state.get("direction")
     entry = position_state.get("entry")
     trailing_sl = position_state.get("trailing_sl")
@@ -348,7 +420,6 @@ def check_exit(price, ts): # `price` likely comes from a separate WebSocket pric
 
     if "block_candles" not in position_state:
         position_state["block_candles"] = []
-
     block = position_state["block_candles"]
 
     if direction == "SELL":
@@ -360,8 +431,9 @@ def check_exit(price, ts): # `price` likely comes from a separate WebSocket pric
             new_sl = max(block) + TRAIL_BUFFER
             if new_sl < trailing_sl:
                 position_state["trailing_sl"] = new_sl
+                symbol = position_state.get("symbol", "UNKNOWN")
                 logging.info(f"📉 Trailing SL moved to {new_sl} after green pullback block")
-                asyncio.create_task(send_telegram(f"📉 Trailing SL moved to {new_sl} after green pullback block for ETHUSD"))
+                asyncio.create_task(send_telegram(f"📉 Trailing SL moved to {new_sl} after green pullback block for {symbol}"))
                 block.clear()
     elif direction == "BUY":
         if prev_last_price is not None and price < prev_last_price:
@@ -372,11 +444,10 @@ def check_exit(price, ts): # `price` likely comes from a separate WebSocket pric
             new_sl = min(block) - TRAIL_BUFFER
             if new_sl > trailing_sl:
                 position_state["trailing_sl"] = new_sl
-                logging.info(f"📈 Trailing SL moved to {new_sl} after red pullback block")
-                asyncio.create_task(send_telegram(f"📈 Trailing SL moved to {new_sl} after red pullback block for ETHUSD"))
+                symbol = position_state.get("symbol", "UNKNOWN")
+                logging.info(f"📉 Trailing SL moved to {new_sl} after red pullback block")
+                asyncio.create_task(send_telegram(f"📉 Trailing SL moved to {new_sl} after red pullback block for {symbol}"))
                 block.clear()
-
-    position_state["block_candles"] = block
 
     if not emergency:
         if direction == "SELL" and entry - price >= EMERGENCY_MOVE:
@@ -384,23 +455,25 @@ def check_exit(price, ts): # `price` likely comes from a separate WebSocket pric
             if new_sl < trailing_sl:
                 position_state["trailing_sl"] = new_sl
                 position_state["emergency"] = True
+                symbol = position_state.get("symbol", "UNKNOWN")
                 logging.info(f"🚨 Emergency SL activated. SL moved to {new_sl}")
-                asyncio.create_task(send_telegram(f"🚨 Emergency SL activated for ETHUSD. SL moved to {new_sl}"))
+                asyncio.create_task(send_telegram(f"🚨 Emergency SL activated for {symbol}. SL moved to {new_sl}"))
         elif direction == "BUY" and price - entry >= EMERGENCY_MOVE:
             new_sl = entry + EMERGENCY_LOCK
             if new_sl > trailing_sl:
                 position_state["trailing_sl"] = new_sl
                 position_state["emergency"] = True
+                symbol = position_state.get("symbol", "UNKNOWN")
                 logging.info(f"🚨 Emergency SL activated. SL moved to {new_sl}")
-                asyncio.create_task(send_telegram(f"🚨 Emergency SL activated for ETHUSD. SL moved to {new_sl}"))
+                asyncio.create_task(send_telegram(f"🚨 Emergency SL activated for {symbol}. SL moved to {new_sl}"))
 
-    trailing_sl = position_state.get("trailing_sl")  # Refresh in case it changed above
-    # Make sure price is available and valid
+    trailing_sl = position_state.get("trailing_sl")
     if price is None:
         logging.warning("⚠️ No price available for exit check.")
         return
 
-    if direction == "BUY" and price <= trailing_sl:
+    logging.debug(f"🧠 Checking SL cross: prev={prev_last_price}, now={price}, SL={trailing_sl}")
+    if direction == "BUY" and (price <= trailing_sl or (prev_last_price and prev_last_price > trailing_sl > price)):
         logging.info(f"🛑 STOP LOSS HIT for BUY at price {price}")
         in_position = False
         exit_msg = (
@@ -413,7 +486,7 @@ def check_exit(price, ts): # `price` likely comes from a separate WebSocket pric
             asyncio.create_task(place_market_order("SELL", qty, order_type="stop_market"))
         open_order_id = None
         return
-    elif direction == "SELL" and price >= trailing_sl:
+    elif direction == "SELL" and (price >= trailing_sl or (prev_last_price and prev_last_price < trailing_sl < price)):
         logging.info(f"🛑 STOP LOSS HIT for SELL at price {price}")
         in_position = False
         exit_msg = (
@@ -426,8 +499,6 @@ def check_exit(price, ts): # `price` likely comes from a separate WebSocket pric
             asyncio.create_task(place_market_order("BUY", qty, order_type="stop_market"))
         open_order_id = None
         return
-
-# === WebSocket Events ===
 
 # --- WebSocket 15m candle update handling (copied from create_15min_candle_ws.py) ---
 async def process_websocket_candle_update(candle_data_from_ws):
@@ -474,7 +545,6 @@ async def process_websocket_candle_update(candle_data_from_ws):
         current_15m_candle['close'] = ws_close
         current_15m_candle['volume'] = ws_volume # Volume is cumulative
 
-
 # Combined WebSocket Message Handler
 def on_message(ws, msg):
     data = json.loads(msg)
@@ -506,25 +576,48 @@ def on_message(ws, msg):
 
             check_exit(price, ts)
 
-            if pending_setup and not pending_setup.get("triggered", False) and not in_position:
+            if ENABLE_CANDLE_FALLBACK and pending_setup and not pending_setup.get("triggered", False) and not in_position:
                 direction = pending_setup["direction"]
                 entry = pending_setup["entry"]
+                candle_low = float(data["low"])
+                candle_high = float(data["high"])
 
-                should_execute = (
-                    (direction == "BUY" and price >= entry) or
-                    (direction == "SELL" and price <= entry)
-                )
+                if direction == "SELL" and candle_low <= entry:
+                    slippage = entry - candle_low
+                    if slippage <= MAX_SLIPPAGE_POINTS:
+                        logging.warning(f"⚠️ Fallback SELL triggered | Candle Low: {candle_low} | Entry: {entry} | Slippage: {slippage:.2f}")
+                        asyncio.create_task(execute_trade("SELL", candle_low, datetime.now(timezone.utc)))
+                        pending_setup["triggered"] = True
+                    else:
+                        logging.info(f"🚫 Fallback SELL skipped (slippage {slippage:.1f} > {MAX_SLIPPAGE_POINTS})")
+                elif direction == "BUY" and candle_high >= entry:
+                    slippage = candle_high - entry
+                    if slippage <= MAX_SLIPPAGE_POINTS:
+                        logging.warning(f"⚠️ Fallback BUY triggered | Candle High: {candle_high} | Entry: {entry} | Slippage: {slippage:.2f}")
+                        asyncio.create_task(execute_trade("BUY", candle_high, datetime.now(timezone.utc)))
+                        pending_setup["triggered"] = True
+                    else:
+                        logging.info(f"🚫 Fallback BUY skipped (slippage {slippage:.1f} > {MAX_SLIPPAGE_POINTS})")
 
-                if should_execute:
-                    asyncio.create_task(execute_trade(direction, price, ts))
+    # === Live Ticks (entry execution based on price proximity) ===
+    elif data.get("type") == "all_trades" and data.get("symbol") == SYMBOL:
+        price = float(data["price"])
+        ts = datetime.fromtimestamp(data["timestamp"] / 1_000_000, tz=timezone.utc)
 
-    elif data.get("channel") == "v2/fills" and "data" in data:
-        fill_info = data.get("data", {})
-        fill_order_id = fill_info.get("order_id")
-        logging.info(f"📥 Received fill for order ID: {fill_order_id}")
-        if fill_order_id == open_order_id:
-            logging.info(f"✅ Confirmed entry fill for Trade #{position_state.get('trade_id')} | Order ID: {fill_order_id}")
-            # Potentially update position_state with fill details like actual fill price
+        logging.info(f"🟡 Tick | {SYMBOL} | {ts.strftime('%H:%M:%S')} | Price={price} | Size={data['size']}")
+
+        # Diagnostic buffer zone check
+        if pending_setup and not pending_setup.get("triggered", False) and not in_position:
+            direction = pending_setup["direction"]
+            entry = pending_setup["entry"]
+
+            if direction == "SELL" and entry - ENTRY_BUFFER <= price <= entry + ENTRY_BUFFER:
+                logging.info(f"🎯 Tick in SELL buffer | Tick: {price} | Entry: {entry} ±{ENTRY_BUFFER}")
+            elif direction == "BUY" and entry - ENTRY_BUFFER <= price <= entry + ENTRY_BUFFER:
+                logging.info(f"🎯 Tick in BUY buffer | Tick: {price} | Entry: {entry} ±{ENTRY_BUFFER}")
+
+        # Entry execution logic
+        asyncio.create_task(process_live_price(price, ts))
 
 # === WebSocket Connection and Main Loop ===
 async def connect_ws():
@@ -536,7 +629,7 @@ async def connect_ws():
         try:
             async with websockets.connect("wss://socket.india.delta.exchange") as ws:
                 logging.info("🟢 Async WebSocket connected")
-                await send_telegram("✅ WebSocket reconnected successfully for ETHUSD.")
+                await send_telegram("✅ WebSocket reconnected successfully for BTCUSD.")
                 
                 # Subscribe to candlestick_15m and trades
                 await ws.send(json.dumps({
@@ -544,7 +637,8 @@ async def connect_ws():
                     "payload": {
                         "channels": [
                             {"name": "candlestick_15m", "symbols": [SYMBOL]},
-                            {"name": "trades", "symbols": [SYMBOL]}
+                            {"name": "all_trades", "symbols": [SYMBOL]}
+                            #{"name": "trades", "symbols": [SYMBOL]}
                         ]
                     }
                 }))
@@ -570,7 +664,7 @@ async def connect_ws():
 
         except Exception as e:
             logging.error(f"WebSocket error: {e}. Retrying in {retry_delay} sec...")
-            await send_telegram(f"❌ WebSocket disconnected for ETHUSD!\nError: {e}")
+            await send_telegram(f"❌ WebSocket disconnected for BTCUSD!\nError: {e}")
             await asyncio.sleep(5)
             if attempt > 100:
                 logging.error("❌ Max reconnect attempts reached. Exiting...")
@@ -599,7 +693,6 @@ async def get_open_positions():
         logging.error(f"Failed to fetch margined positions: {e}")
         return {}
 
-
 async def initialize_state_from_delta():
     global in_position, position_state
 
@@ -609,7 +702,7 @@ async def initialize_state_from_delta():
 
         active_positions = [
             pos for pos in positions
-            if pos.get("product_id") == 3136 and float(pos.get("size", 0)) > 0
+            if pos.get("product_id") == PRODUCT_ID and float(pos.get("size", 0)) > 0
         ]
 
         if active_positions:
@@ -638,18 +731,51 @@ async def initialize_state_from_delta():
     except Exception as e:
         logging.error(f"Failed to initialize state: {e}")
 
-def write_heartbeat():
+async def heartbeat_loop():
+    logging.info("🫀 Heartbeat loop started. Bot health will be monitored.")
+    while True:
+        write_heartbeat()
+        await asyncio.sleep(60)  # Update every 60 seconds
+
+async def execute_exit(reason, price, ts):
+    global in_position
+    logging.warning(f"📉 Exit Trade | Reason: {reason} | Price: {price}")
+    in_position = False
+    position_state.clear()
+
+    await send_telegram(f"📉 EXIT | Reason: {reason} | Price: {price} | Time: {ts.strftime('%H:%M:%S UTC')}")
+
+def save_trade_log(log_entry):
     try:
-        with open(HEARTBEAT_FILE, "w") as f:
-            f.write(datetime.now(timezone.utc).isoformat())
+        with open("live_trade_log.csv", "a") as f:
+            writer = csv.DictWriter(f, fieldnames=log_entry.keys())
+            if f.tell() == 0:
+                writer.writeheader()
+            writer.writerow(log_entry)
+        logging.info("📄 Trade logged successfully.")
     except Exception as e:
-        logging.error(f"Heartbeat write failed: {e}")
+        logging.error(f"❌ Failed to log trade: {e}")
 
 if __name__ == "__main__":
     logging.info("🚀 Starting Hybrid Bot in SIMULATION mode" if not LIVE_MODE else "🚀 Starting Hybrid Bot in LIVE mode")
+    logging.info("🚀 Hybrid Bot Startup Summary")
+    logging.info(f"📈 Symbol       : {SYMBOL}")
+    logging.info(f"🫀 Healthcheck  : ENABLED (heartbeat every 60s)")
+    logging.info(f"📂 Data Path    : {TRADES_LOG_PATH}")
+    logging.info("📡 Initializing WebSocket and strategy components...\n")
+    logging.info(f"🎯 MAX_SLIPPAGE_POINTS loaded: {MAX_SLIPPAGE_POINTS}")
+    if not LIVE_MODE:
+        mode_label = "SIMULATION (No real orders, shadow trading)"
+    elif LIVE_MODE and TEST_MODE:
+        mode_label = "LIVE-TEST (API active, Order tested & cancelled immediately)"
+    else:
+        mode_label = "LIVE (Real money trading enabled)"
+
+    logging.info(f"🔧 Mode         : {mode_label}")
     
     async def main():
-        await initialize_state_from_delta()
+        asyncio.create_task(heartbeat_loop())
+        await initialize_state_from_delta() 
         await connect_ws()
 
     try:

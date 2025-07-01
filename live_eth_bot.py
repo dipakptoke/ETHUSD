@@ -32,11 +32,12 @@ TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 ENTRY_BUFFER = float(os.getenv("ENTRY_BUFFER", "9.0"))
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "100"))
 logging.info(f"🎯 ENTRY_BUFFER loaded: ±{ENTRY_BUFFER} points")
 ENABLE_CANDLE_FALLBACK = True  # Set to False to disable fallback logic
 MAX_SLIPPAGE_POINTS = float(os.getenv("MAX_SLIPPAGE_POINTS", "27"))
-HEARTBEAT_FILE = "/app/heartbeat"
-TRADES_LOG_PATH = "data/live_trades.csv"
+HEARTBEAT_FILE = "/app/data/heartbeat"
+TRADES_LOG_PATH = os.getenv("TRADES_LOG_PATH", "/app/data/live_trades.csv")
 
 # === Global variables for 15m candle aggregation ===
 PRODUCT_ID = int(os.getenv("PRODUCT_ID", "3136"))
@@ -80,6 +81,15 @@ open_order_id = None
 # === Helpers ===
 def floor_qty(q): return math.floor(q * 1000) / 1000
 
+async def handle_private_ws_msg(msg):
+    topic = msg.get("topic", "")
+    data = msg.get("data", {})
+
+    if topic.startswith("v2/fills"):
+        await process_order_fill(data)
+    elif topic.startswith("v2/orders"):
+        await process_order_status(data)
+
 async def send_telegram(msg):
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
@@ -93,7 +103,10 @@ async def send_telegram(msg):
 def write_heartbeat():
     try:
         with open(HEARTBEAT_FILE, "w") as f:
-            f.write(datetime.now(timezone.utc).isoformat())
+            f.write(datetime.now(timezone.utc).isoformat() + "\n")
+            f.flush()  # <-- force buffer to disk
+            os.fsync(f.fileno())  # <-- ensure it's written even on Docker mounts
+        logging.info(f"🫀 Heartbeat written successfully.")
     except Exception as e:
         logging.error(f"Heartbeat write failed: {e}")
 
@@ -158,7 +171,7 @@ async def place_market_order(side, qty, order_type="limit"):
         logging.error(f"❌ Order placement failed: {e}")
         return {"status": "error", "message": str(e)}
 
-async def place_bracket_order(side, price, qty, sl_price, tp_price):
+async def place_bracket_order(side, price, qty, sl_price, tp_price=None):
     endpoint = "/v2/orders/bracket"
     url = "https://api.india.delta.exchange" + endpoint
 
@@ -172,13 +185,15 @@ async def place_bracket_order(side, price, qty, sl_price, tp_price):
             "order_type": "market_order",
             "stop_price": str(sl_price)
         },
-        "take_profit_order": {
+        "bracket_stop_trigger_method": "last_traded_price"
+    }
+
+    if tp_price:
+        payload["take_profit_order"] = {
             "order_type": "limit_order",
             "stop_price": str(tp_price),
             "limit_price": str(tp_price)
-        },
-        "bracket_stop_trigger_method": "last_traded_price"
-    }
+        }
 
     body = json.dumps(payload, separators=(',', ':'), sort_keys=True)
     ts, signature = generate_signature(DELTA_API_SECRET, "POST", endpoint, body)
@@ -191,32 +206,54 @@ async def place_bracket_order(side, price, qty, sl_price, tp_price):
         "Accept": "application/json"
     }
 
-    if TEST_MODE:
-        logging.info("🧪 TEST MODE | Bracket order not sent. Would send:")
+    if not LIVE_MODE:
+        logging.info("🧪 SIM MODE | Bracket order not sent. Would send:")
         logging.info(json.dumps(payload, indent=2))
-        return
+        return {"simulated": True, "payload": payload}
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, data=body) as resp:
                 resp_json = await resp.json()
-                logging.info(f"📤 Bracket Order Response: {resp_json}")
+                if resp.status == 200:
+                    logging.info(f"✅ Bracket Order Placed | Side: {side.upper()} | Price: {price} | Qty: {qty}")
+                else:
+                    logging.warning(f"⚠️ Bracket order status {resp.status} | Resp: {resp_json}")
                 return resp_json
     except Exception as e:
         logging.error(f"❌ Bracket order failed: {e}")
         return {"error": str(e)}
 
+async def process_order_fill(data):
+    global in_position, position_state
+
+    order_id = data.get("order_id")
+    filled_qty = float(data.get("size", 0))
+    side = data.get("side")
+    price = data.get("price")
+
+    if not order_id or filled_qty == 0:
+        return
+
+    logging.info(f"📬 Order Filled | ID: {order_id} | Side: {side} | Qty: {filled_qty} | Price: {price}")
+
+    if in_position and position_state.get("bracket_order_id") == order_id:
+        position_state["filled"] = True
+        position_state["fill_price"] = float(price)
+        logging.info(f"✅ Entry Fill Confirmed | Order ID: {order_id} | Fill Price: {price}")
+    else:
+        logging.warning(f"⚠️ Fill received for unmatched or inactive order ID: {order_id}")
+
 # === Candle Management (Only finalize_candle is used now, as WS handles updates) ===
 def finalize_candle(candle):
-    global ohlc_data
-    # Ensure candle data is not missing critical values before adding
+    global ohlc_data, in_position, position_state
+
+    # Validate input
     if not isinstance(candle, dict) or any(k not in candle for k in ["timestamp", "open", "high", "low", "close", "volume"]):
         logging.error(f"❌ Invalid candle data provided to finalize_candle: {candle}")
         return
 
     candle_df = pd.DataFrame([candle])
-    
-    # Check for NaN values more robustly after converting to DataFrame
     if candle_df[["open", "high", "low", "close", "volume"]].isnull().values.any():
         logging.warning(f"⚠️ Skipping finalization due to NaN values in candle: {candle}")
         return
@@ -227,20 +264,67 @@ def finalize_candle(candle):
     else:
         ohlc_data = candle_df.copy()
 
-    # Trim OHLC data to the last 100 rows for memory efficiency
-    if len(ohlc_data) > 100:
-        ohlc_data = ohlc_data.iloc[-100:].reset_index(drop=True)
-    
-    # Ensure EMA is only calculated when enough data is present
+    # Trim candles
+    if len(ohlc_data) > MAX_CANDLES:
+        ohlc_data = ohlc_data.iloc[-MAX_CANDLES:].reset_index(drop=True)
+
+    # EMA calculation
     if len(ohlc_data) >= EMA_PERIOD:
-        # Calculate EMA for the entire series to avoid issues with new data
-        ohlc_data.loc[:, "ema"] = ohlc_data["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-        
+        ohlc_data["ema"] = ohlc_data["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+
     logging.info(f"📊 Finalized 15m candle: {ohlc_data.iloc[-1].to_dict()}")
-    if not ohlc_data.empty and len(ohlc_data) >= EMA_PERIOD:
+    if len(ohlc_data) >= EMA_PERIOD:
         logging.info(f"🔍 EMA value calculated: {ohlc_data.iloc[-1]['ema']:.2f}")
     else:
         logging.info("🔍 EMA not yet calculated (not enough candles).")
+
+      # ✅ Trailing SL via 15m candles
+    if in_position:
+        update_trailing_sl_from_candle(candle)
+
+def update_trailing_sl_from_candle(candle):
+    global position_state, in_position
+
+    if not in_position or not candle:
+        return
+
+    direction = position_state.get("direction")
+    trailing_sl = position_state.get("trailing_sl")
+    entry = position_state.get("entry")
+    symbol = position_state.get("symbol", "UNKNOWN")
+    sl_order_id = position_state.get("sl_order_id")
+    trail_buffer = float(os.getenv("TRAIL_BUFFER", 2.0))
+
+    candle_open = candle["open"]
+    candle_close = candle["close"]
+    candle_high = candle["high"]
+    candle_low = candle["low"]
+
+    if direction == "SELL":
+        is_green = candle_close > candle_open
+        broke_low = candle_low < entry  # ✅ must break low of pullback
+        if is_green and broke_low:
+            new_sl = round(candle_high + trail_buffer, 1)
+            if new_sl < trailing_sl:
+                position_state["trailing_sl"] = new_sl
+                logging.info(f"📉 Trailing SL moved to {new_sl} after GREEN candle break (SELL)")
+                asyncio.create_task(send_telegram(
+                    f"📉 Trailing SL moved to {new_sl} after green pullback for {symbol}"))
+                if LIVE_MODE and sl_order_id:
+                    asyncio.create_task(update_stop_loss_order(sl_order_id, new_sl))
+
+    elif direction == "BUY":
+        is_red = candle_close < candle_open
+        broke_high = candle_high > entry  # ✅ must break high of red pullback
+        if is_red and broke_high:
+            new_sl = round(candle_low - trail_buffer, 1)
+            if new_sl > trailing_sl:
+                position_state["trailing_sl"] = new_sl
+                logging.info(f"📈 Trailing SL moved to {new_sl} after RED candle break (BUY)")
+                asyncio.create_task(send_telegram(
+                    f"📈 Trailing SL moved to {new_sl} after red pullback for {symbol}"))
+                if LIVE_MODE and sl_order_id:
+                    asyncio.create_task(update_stop_loss_order(sl_order_id, new_sl))
 
 # === Strategy ===
 async def detect_trade():
@@ -340,14 +424,22 @@ async def process_live_price(price, ts):
     global in_position, pending_setup
     logging.debug(f"🟡 Tick | Price: {price} | Time: {ts.strftime('%H:%M:%S')}")
 
+    # Step 1: Check for Exit Logic if in trade
     await check_exit(price, ts)
 
+    # Step 2: If a pending setup exists and not yet triggered
     if pending_setup and not pending_setup.get("triggered", False) and not in_position:
         direction = pending_setup["direction"]
         entry = pending_setup["entry"]
 
         buffer_low = entry - ENTRY_BUFFER
         buffer_high = entry + ENTRY_BUFFER
+
+        # Debugging info
+        logging.debug(
+            f"🧪 Setup Active → Dir: {direction} | Price: {price} | "
+            f"Entry: {entry} | Buffer: {buffer_low:.1f}–{buffer_high:.1f} | Triggered: {pending_setup.get('triggered')}"
+        )
 
         if direction == "SELL" and buffer_low <= price <= buffer_high:
             logging.info(f"✅ SELL Triggered | Tick: {price} | Entry: {entry} | Buffer: {buffer_low:.1f}–{buffer_high:.1f}")
@@ -368,26 +460,67 @@ async def execute_trade(direction, price, ts, fallback=False):
     risk = pending_setup["risk"]
     qty = pending_setup["qty"]
 
-    # Safety: Skip if time drifted too far
     current_ts = datetime.now(timezone.utc)
     if fallback and (current_ts - setup_ts) > timedelta(minutes=15):
         logging.warning("⚠️ Fallback trigger too delayed. Skipping execution.")
         return
 
-    direction_str = "BUY" if direction == "BUY" else "SELL"
-    logging.info(f"📈 EXECUTING {direction_str} | Price: {entry}, SL: {sl}, Qty: {qty}")
+    logging.info(f"📈 EXECUTING {direction} | Price: {entry}, SL: {sl}, Qty: {qty}")
 
-    tp = entry + 2 * risk if direction == "BUY" else entry - 2 * risk
+    sl_order_id = None
 
     if LIVE_MODE:
-        await place_bracket_order(direction, entry, qty, sl, tp)
+        response = await place_bracket_order(direction, entry, qty, sl)
+        if isinstance(response, dict):
+            if response.get("success") and "id" in response:
+                sl_order_id = response["id"]
+                logging.info(f"✅ Bracket order placed. SL Order ID: {sl_order_id}")
+            elif response.get("result") and "id" in response["result"]:
+                sl_order_id = response["result"]["id"]
+                logging.info(f"✅ Bracket order placed (nested). SL Order ID: {sl_order_id}")
+            else:
+                logging.warning(f"⚠️ Could not find SL Order ID in response: {response}")
+        else:
+            logging.error(f"❌ Unexpected bracket order response: {response}")
     else:
-        logging.info(f"🧪 SIM MODE ENTRY | {direction} at {entry}, SL: {sl}, TP: {tp}, Qty: {qty}")
+        logging.info("🧪 SIM MODE | Bracket order not sent. Would send:")
+        simulated_order = {
+            "product_id": PRODUCT_ID,
+            "side": direction.lower(),
+            "order_type": "limit_order",
+            "price": str(entry),
+            "size": qty,
+            "stop_loss_order": {
+                "order_type": "market_order",
+                "stop_price": str(sl)
+            },
+            "bracket_stop_trigger_method": "last_traded_price"
+        }
+        logging.info(json.dumps(simulated_order, indent=2))
+        sl_order_id = f"SIM-{trade_id_counter}"
 
-    # Update internal state
+    # 🔁 Update bot state
     trade_id_counter += 1
     in_position = True
     last_price = entry
+
+    position_state.update({
+        "id": trade_id_counter,
+        "symbol": SYMBOL,
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "qty": qty,
+        "risk": risk,
+        "trailing_sl": sl,
+        "emergency": False,
+        "block_candles": [],
+        "last_price": None,
+        "start_ts": ts,
+        "sl_order_id": sl_order_id,
+        "filled": False,
+        "bracket_order_id": sl_order_id
+    })
 
     trade_log = {
         "id": trade_id_counter,
@@ -400,12 +533,23 @@ async def execute_trade(direction, price, ts, fallback=False):
     }
     save_trade_log(trade_log)
 
-    msg = f"📥 {direction} ORDER PLACED\n🎯 Entry: {entry}\n🛑 SL: {sl}\n📦 Qty: {qty}"
+    msg = (
+        f"📥 {direction} ORDER PLACED\n"
+        f"🎯 Entry: {entry}\n"
+        f"🛑 SL: {sl}\n"
+        f"📦 Qty: {qty}"
+    )
     await send_telegram(msg)
+
 
 async def check_exit(price, ts):
     global in_position, position_state, open_order_id
+
     if not in_position:
+        return
+    
+    if not position_state.get("filled", False):
+        logging.warning("⏳ Waiting for order fill confirmation. Skipping exit logic.")
         return
 
     direction = position_state.get("direction")
@@ -413,7 +557,7 @@ async def check_exit(price, ts):
     trailing_sl = position_state.get("trailing_sl")
     emergency = position_state.get("emergency", False)
     qty = position_state.get("qty")
-    risk = position_state.get("risk")
+    symbol = position_state.get("symbol", "UNKNOWN")
 
     prev_last_price = position_state.get("last_price")
     position_state["last_price"] = price
@@ -421,6 +565,10 @@ async def check_exit(price, ts):
     if "block_candles" not in position_state:
         position_state["block_candles"] = []
     block = position_state["block_candles"]
+
+    # ➤ Trailing SL Logic (Block Pullbacks)
+    sl_updated = False
+    new_sl = None
 
     if direction == "SELL":
         if prev_last_price is not None and price > prev_last_price:
@@ -431,10 +579,11 @@ async def check_exit(price, ts):
             new_sl = max(block) + TRAIL_BUFFER
             if new_sl < trailing_sl:
                 position_state["trailing_sl"] = new_sl
-                symbol = position_state.get("symbol", "UNKNOWN")
-                logging.info(f"📉 Trailing SL moved to {new_sl} after green pullback block")
-                asyncio.create_task(send_telegram(f"📉 Trailing SL moved to {new_sl} after green pullback block for {symbol}"))
+                sl_updated = True
                 block.clear()
+                logging.info(f"📉 Trailing SL moved to {new_sl} after green pullback block")
+                await send_telegram(f"📉 Trailing SL moved to {new_sl} after green pullback block for {symbol}")
+
     elif direction == "BUY":
         if prev_last_price is not None and price < prev_last_price:
             block.append(price)
@@ -444,62 +593,93 @@ async def check_exit(price, ts):
             new_sl = min(block) - TRAIL_BUFFER
             if new_sl > trailing_sl:
                 position_state["trailing_sl"] = new_sl
-                symbol = position_state.get("symbol", "UNKNOWN")
-                logging.info(f"📉 Trailing SL moved to {new_sl} after red pullback block")
-                asyncio.create_task(send_telegram(f"📉 Trailing SL moved to {new_sl} after red pullback block for {symbol}"))
+                sl_updated = True
                 block.clear()
+                logging.info(f"📈 Trailing SL moved to {new_sl} after red pullback block")
+                await send_telegram(f"📈 Trailing SL moved to {new_sl} after red pullback block for {symbol}")
 
+    # ➤ Emergency SL Lock-in
     if not emergency:
         if direction == "SELL" and entry - price >= EMERGENCY_MOVE:
             new_sl = entry - EMERGENCY_LOCK
             if new_sl < trailing_sl:
                 position_state["trailing_sl"] = new_sl
                 position_state["emergency"] = True
-                symbol = position_state.get("symbol", "UNKNOWN")
+                sl_updated = True
                 logging.info(f"🚨 Emergency SL activated. SL moved to {new_sl}")
-                asyncio.create_task(send_telegram(f"🚨 Emergency SL activated for {symbol}. SL moved to {new_sl}"))
+                await send_telegram(f"🚨 Emergency SL activated for {symbol}. SL moved to {new_sl}")
+
         elif direction == "BUY" and price - entry >= EMERGENCY_MOVE:
             new_sl = entry + EMERGENCY_LOCK
             if new_sl > trailing_sl:
                 position_state["trailing_sl"] = new_sl
                 position_state["emergency"] = True
-                symbol = position_state.get("symbol", "UNKNOWN")
+                sl_updated = True
                 logging.info(f"🚨 Emergency SL activated. SL moved to {new_sl}")
-                asyncio.create_task(send_telegram(f"🚨 Emergency SL activated for {symbol}. SL moved to {new_sl}"))
+                await send_telegram(f"🚨 Emergency SL activated for {symbol}. SL moved to {new_sl}")
 
+    # ✅ Update SL on Exchange if changed
+    if sl_updated and LIVE_MODE and position_state.get("sl_order_id"):
+        response = await update_stop_loss_order(position_state["sl_order_id"], position_state["trailing_sl"])
+        if response.get("error"):
+            logging.warning(f"⚠️ SL update failed on Delta: {response}")
+        else:
+            logging.info(f"✅ SL successfully updated on Delta to {position_state['trailing_sl']}")
+
+    # ➤ Final Exit Check (with buffer)
     trailing_sl = position_state.get("trailing_sl")
-    if price is None:
-        logging.warning("⚠️ No price available for exit check.")
+    if price is None or trailing_sl is None:
+        logging.warning("⚠️ Exit check skipped – missing price or SL.")
         return
 
-    logging.debug(f"🧠 Checking SL cross: prev={prev_last_price}, now={price}, SL={trailing_sl}")
-    if direction == "BUY" and (price <= trailing_sl or (prev_last_price and prev_last_price > trailing_sl > price)):
+    exit_buffer = float(os.getenv("SL_EXIT_BUFFER", 2.5))
+    logging.debug(f"🧠 SL Check: Price={price}, SL={trailing_sl}, Buffer={exit_buffer}")
+
+    if direction == "BUY" and price <= trailing_sl + exit_buffer:
         logging.info(f"🛑 STOP LOSS HIT for BUY at price {price}")
-        in_position = False
-        exit_msg = (
-            f"🛑 STOP LOSS HIT for BUY at {price} on {ts.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-            f"📤 Sending STOP-MARKET Order: SELL {qty} @ {trailing_sl}"
-        )
-        asyncio.create_task(send_telegram(exit_msg))
-        logging.info(exit_msg)
-        if LIVE_MODE:
-            asyncio.create_task(place_market_order("SELL", qty, order_type="stop_market"))
-        open_order_id = None
-        return
-    elif direction == "SELL" and (price >= trailing_sl or (prev_last_price and prev_last_price < trailing_sl < price)):
-        logging.info(f"🛑 STOP LOSS HIT for SELL at price {price}")
-        in_position = False
-        exit_msg = (
-            f"🛑 STOP LOSS HIT for SELL at {price} on {ts.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-            f"📤 Sending STOP-MARKET Order: BUY {qty} @ {trailing_sl}"
-        )
-        asyncio.create_task(send_telegram(exit_msg))
-        logging.info(exit_msg)
-        if LIVE_MODE:
-            asyncio.create_task(place_market_order("BUY", qty, order_type="stop_market"))
-        open_order_id = None
-        return
+        await execute_exit("SL_HIT", price, ts)
 
+    elif direction == "SELL" and price >= trailing_sl - exit_buffer:
+        logging.info(f"🛑 STOP LOSS HIT for SELL at price {price}")
+        await execute_exit("SL_HIT", price, ts)
+
+async def update_stop_loss_order(order_id, new_sl_price):
+    url = "https://api.india.delta.exchange/v2/orders/edit-bracket"
+    payload = {
+        "order_id": order_id,
+        "stop_loss_order": {
+            "order_type": "market_order",
+            "stop_price": str(new_sl_price)
+        },
+        "bracket_stop_trigger_method": "last_traded_price"
+    }
+
+    body = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    ts, signature = generate_signature(
+        DELTA_API_SECRET, "POST", "/v2/orders/edit-bracket", body
+    )
+
+    headers = {
+        "api-key": DELTA_API_KEY,
+        "timestamp": ts,
+        "signature": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=body) as resp:
+                resp_json = await resp.json()
+                if resp.status == 200 and resp_json.get("status") == "success":
+                    logging.info(f"✅ SL Updated Successfully | New SL: {new_sl_price}")
+                else:
+                    logging.warning(f"⚠️ SL Update Failed | API Response: {resp_json}")
+                return resp_json
+    except Exception as e:
+        logging.error(f"❌ SL Update Exception: {e}")
+        return {"error": str(e)}
+    
 # --- WebSocket 15m candle update handling (copied from create_15min_candle_ws.py) ---
 async def process_websocket_candle_update(candle_data_from_ws):
     global current_15m_candle, last_15m_candle_start_time, ohlc_data, finalized_candle_timestamps
@@ -618,6 +798,17 @@ def on_message(ws, msg):
 
         # Entry execution logic
         asyncio.create_task(process_live_price(price, ts))
+    elif data.get("type") == "v2/orders":
+        logging.info(f"📬 ORDER STATUS UPDATE: {json.dumps(data, indent=2)}")
+    # You can optionally track open/closed order status here
+    # Useful for debugging rejections or partial fills
+
+    elif data.get("type") == "v2/fills":
+        logging.info(f"📦 ORDER FILL CONFIRMED: {json.dumps(data, indent=2)}")
+        if "order" in data:
+            order = data["order"]
+            if order.get("order_type") == "market_order" and order.get("reason") == "stop_loss":
+                asyncio.create_task(execute_exit("SL_FILLED", float(order["price"]), datetime.now(timezone.utc)))
 
 # === WebSocket Connection and Main Loop ===
 async def connect_ws():
@@ -629,7 +820,7 @@ async def connect_ws():
         try:
             async with websockets.connect("wss://socket.india.delta.exchange") as ws:
                 logging.info("🟢 Async WebSocket connected")
-                await send_telegram("✅ WebSocket reconnected successfully for BTCUSD.")
+                await send_telegram(f"✅ WebSocket reconnected successfully for {SYMBOL}.")
                 
                 # Subscribe to candlestick_15m and trades
                 await ws.send(json.dumps({
@@ -669,6 +860,7 @@ async def connect_ws():
             if attempt > 100:
                 logging.error("❌ Max reconnect attempts reached. Exiting...")
                 break
+
 
 async def get_open_positions():
     endpoint = "/v2/positions/margined"
@@ -747,12 +939,12 @@ async def execute_exit(reason, price, ts):
 
 def save_trade_log(log_entry):
     try:
-        with open("live_trade_log.csv", "a") as f:
+        with open(TRADES_LOG_PATH, "a") as f:
             writer = csv.DictWriter(f, fieldnames=log_entry.keys())
             if f.tell() == 0:
                 writer.writeheader()
             writer.writerow(log_entry)
-        logging.info("📄 Trade logged successfully.")
+        logging.info(f"📄 Trade logged successfully to {TRADES_LOG_PATH}.")
     except Exception as e:
         logging.error(f"❌ Failed to log trade: {e}")
 
@@ -774,6 +966,7 @@ if __name__ == "__main__":
     logging.info(f"🔧 Mode         : {mode_label}")
     
     async def main():
+        os.makedirs("data", exist_ok=True)
         asyncio.create_task(heartbeat_loop())
         await initialize_state_from_delta() 
         await connect_ws()

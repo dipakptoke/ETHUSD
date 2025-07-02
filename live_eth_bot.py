@@ -13,17 +13,6 @@ import hashlib
 import time
 import csv
 
-# === Logging ===
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    handlers=[
-        logging.FileHandler("logs/eth_bot.log"),
-        logging.StreamHandler()
-    ])
-
-
 # === File paths for logs ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -37,7 +26,43 @@ logging.info(f"🎯 ENTRY_BUFFER loaded: ±{ENTRY_BUFFER} points")
 ENABLE_CANDLE_FALLBACK = True  # Set to False to disable fallback logic
 MAX_SLIPPAGE_POINTS = float(os.getenv("MAX_SLIPPAGE_POINTS", "27"))
 HEARTBEAT_FILE = "/app/data/heartbeat"
-TRADES_LOG_PATH = os.getenv("TRADES_LOG_PATH", "/app/data/live_trades.csv")
+# TRADES_LOG_PATH = os.getenv("TRADES_LOG_PATH", "/app/data/live_trades.csv")
+SYMBOL = os.getenv("SYMBOL", "BTCUSD").upper()
+TRADES_LOG_PATH = f"data/{SYMBOL.lower()}_trades.csv"
+
+os.makedirs("logs", exist_ok=True)
+
+log_file = f"logs/{SYMBOL.lower()}_bot.log"
+
+class ExcludeVerboseFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return not ("Tick |" in msg or "RAW WS 15m Update" in msg)
+
+# Create logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Clear any existing handlers
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+logger.addHandler(console_handler)
+
+# File handler with filter
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(logging.INFO)
+file_handler.addFilter(ExcludeVerboseFilter())
+file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+logger.addHandler(file_handler)
+
+# Test log line
+logging.info(f"✅ Logging initialized for symbol {SYMBOL}")
+
 
 # === Global variables for 15m candle aggregation ===
 PRODUCT_ID = int(os.getenv("PRODUCT_ID", "3136"))
@@ -54,9 +79,9 @@ open_order_id = None
 latest_tick = {"price": None, "timestamp": None}
 
 # === Config ===
-SYMBOL = "ETHUSD"
+# SYMBOL = "ETHUSD"
 EMA_PERIOD = 5
-TRAIL_BUFFER = 5
+TRAIL_BUFFER = 2
 EMERGENCY_MOVE = 500
 EMERGENCY_LOCK = 150
 MIN_CANDLE_POINTS = 10
@@ -290,7 +315,6 @@ def update_trailing_sl_from_candle(candle):
 
     direction = position_state.get("direction")
     trailing_sl = position_state.get("trailing_sl")
-    entry = position_state.get("entry")
     symbol = position_state.get("symbol", "UNKNOWN")
     sl_order_id = position_state.get("sl_order_id")
     trail_buffer = float(os.getenv("TRAIL_BUFFER", 2.0))
@@ -300,31 +324,56 @@ def update_trailing_sl_from_candle(candle):
     candle_high = candle["high"]
     candle_low = candle["low"]
 
+    pullback = position_state.get("pullback", None)
+
+    # SELL logic (track GREEN pullback and break below)
     if direction == "SELL":
         is_green = candle_close > candle_open
-        broke_low = candle_low < entry  # ✅ must break low of pullback
-        if is_green and broke_low:
-            new_sl = round(candle_high + trail_buffer, 1)
-            if new_sl < trailing_sl:
-                position_state["trailing_sl"] = new_sl
-                logging.info(f"📉 Trailing SL moved to {new_sl} after GREEN candle break (SELL)")
-                asyncio.create_task(send_telegram(
-                    f"📉 Trailing SL moved to {new_sl} after green pullback for {symbol}"))
-                if LIVE_MODE and sl_order_id:
-                    asyncio.create_task(update_stop_loss_order(sl_order_id, new_sl))
 
+        # 1. Store latest green pullback
+        if is_green:
+            position_state["pullback"] = {
+                "high": candle_high,
+                "low": candle_low,
+                "confirmed": False
+            }
+
+        # 2. Break of pullback low triggers SL move
+        elif pullback and not pullback["confirmed"]:
+            if candle_low < pullback["low"]:
+                new_sl = round(pullback["high"] + trail_buffer, 1)
+                if new_sl < trailing_sl:
+                    position_state["trailing_sl"] = new_sl
+                    pullback["confirmed"] = True
+                    logging.info(f"📉 Trailing SL moved to {new_sl} after GREEN pullback break (SELL)")
+                    asyncio.create_task(send_telegram(f"📉 Trailing SL moved to {new_sl} after GREEN pullback break for {symbol}"))
+                    if LIVE_MODE and sl_order_id:
+                        asyncio.create_task(update_stop_loss_order(sl_order_id, new_sl))
+
+    # BUY logic (track RED pullback and break above)
     elif direction == "BUY":
         is_red = candle_close < candle_open
-        broke_high = candle_high > entry  # ✅ must break high of red pullback
-        if is_red and broke_high:
-            new_sl = round(candle_low - trail_buffer, 1)
-            if new_sl > trailing_sl:
-                position_state["trailing_sl"] = new_sl
-                logging.info(f"📈 Trailing SL moved to {new_sl} after RED candle break (BUY)")
-                asyncio.create_task(send_telegram(
-                    f"📈 Trailing SL moved to {new_sl} after red pullback for {symbol}"))
-                if LIVE_MODE and sl_order_id:
-                    asyncio.create_task(update_stop_loss_order(sl_order_id, new_sl))
+
+        if is_red:
+            position_state["pullback"] = {
+                "high": candle_high,
+                "low": candle_low,
+                "confirmed": False
+            }
+
+        elif pullback and not pullback["confirmed"]:
+            if candle_high > pullback["high"]:
+                new_sl = round(pullback["low"] - trail_buffer, 1)
+                if new_sl > trailing_sl:
+                    position_state["trailing_sl"] = new_sl
+                    pullback["confirmed"] = True
+                    logging.info(f"📈 Trailing SL moved to {new_sl} after RED pullback break (BUY)")
+                    asyncio.create_task(send_telegram(f"📈 Trailing SL moved to {new_sl} after RED pullback break for {symbol}"))
+                    if LIVE_MODE and sl_order_id:
+                        asyncio.create_task(update_stop_loss_order(sl_order_id, new_sl))
+
+    # Save updated pullback state
+    position_state["pullback"] = position_state.get("pullback", pullback)
 
 # === Strategy ===
 async def detect_trade():
@@ -519,7 +568,8 @@ async def execute_trade(direction, price, ts, fallback=False):
         "start_ts": ts,
         "sl_order_id": sl_order_id,
         "filled": False,
-        "bracket_order_id": sl_order_id
+        "bracket_order_id": sl_order_id,
+        "filled": not LIVE_MODE
     })
 
     trade_log = {
@@ -548,9 +598,14 @@ async def check_exit(price, ts):
     if not in_position:
         return
     
-    if not position_state.get("filled", False):
-        logging.warning("⏳ Waiting for order fill confirmation. Skipping exit logic.")
+    if LIVE_MODE and not position_state.get("filled", False):
+        logging.info("⏳ Waiting for order fill confirmation. Skipping exit logic.")
         return
+
+
+    # if not position_state.get("filled", False): 
+    #     logging.warning("⏳ Waiting for order fill confirmation. Skipping exit logic.")
+    #     return
 
     direction = position_state.get("direction")
     entry = position_state.get("entry")
